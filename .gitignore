@@ -1,0 +1,46 @@
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Build output
+bin/
+obj/
+[Bb]uild/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+
+# Publish output
+publish/
+
+# NuGet
+packages/
+*.nupkg
+
+# Visual Studio generated files
+Generated\ Files/
+
+# Test results
+TestResults/
+
+# Logs
+*.log
+
+# Operating system files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Local databases and GameWatch runtime data
+*.db
+*.db-shm
+*.db-wal
+GameSessions.txt
+ActiveSession.txt
+
+# Installer build output
+GameWatchInstaller/Output/
