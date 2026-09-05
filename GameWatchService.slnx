@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="GameWatchDashboard/GameWatchDashboard.csproj" Id="05e0e077-d258-4129-9422-c444620f1302" />
+  <Project Path="GameWatchService/GameWatchService.csproj" />
+</Solution>
