@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Runtime.InteropServices;
 using Microsoft.Data.Sqlite;
 using Microsoft.Win32;
 
@@ -18,6 +19,12 @@ namespace GameWatchService
 
         private string databasePath =
             string.Empty;
+
+        // Launcher labels discovered dynamically while a game is running.
+        // This is used for games such as Minecraft where the same Java
+        // process can come from several different launchers.
+        private readonly Dictionary<string, string> detectedLauncherOverrides =
+            new(StringComparer.OrdinalIgnoreCase);
 
         // Apps that should never count as games.
         private static readonly HashSet<string> IgnoredGameNames =
@@ -40,7 +47,15 @@ namespace GameWatchService
                 "Origin",
 
                 "Ubisoft Connect",
-                "Ubisoft Game Launcher"
+                "Ubisoft Game Launcher",
+
+                "Minecraft Launcher",
+                "CurseForge",
+                "Prism Launcher",
+                "Modrinth",
+                "ATLauncher",
+                "GDLauncher",
+                "MultiMC"
             };
 
         // =========================================================
@@ -78,6 +93,8 @@ namespace GameWatchService
                     RefreshInstalledGames();
                 }
 
+                detectedLauncherOverrides.Clear();
+
                 HashSet<string> runningGames =
                     DetectRunningInstalledGames(
                         installedGames);
@@ -86,6 +103,9 @@ namespace GameWatchService
                     runningGames);
 
                 DetectKnownBattleNetProcesses(
+                    runningGames);
+
+                DetectMinecraftProcesses(
                     runningGames);
 
                 LoadManualGames(
@@ -230,6 +250,13 @@ namespace GameWatchService
         private string GetLauncherForGame(
             string gameName)
         {
+            if (detectedLauncherOverrides.TryGetValue(
+                gameName,
+                out string? launcherOverride))
+            {
+                return launcherOverride;
+            }
+
             InstalledGame? installedGame =
                 installedGames
                     .FirstOrDefault(
@@ -884,6 +911,578 @@ namespace GameWatchService
         }
 
         // =========================================================
+        // MINECRAFT / MODDED MINECRAFT
+        // =========================================================
+
+        private void DetectMinecraftProcesses(
+            HashSet<string> runningGames)
+        {
+            Process[] processes =
+                Process.GetProcesses();
+
+            string fallbackLauncher =
+                DetectRunningMinecraftLauncher(
+                    processes);
+
+            foreach (Process process in processes)
+            {
+                try
+                {
+                    string processName =
+                        process.ProcessName;
+
+                    // Minecraft for Windows / Bedrock Edition.
+                    if (processName.Equals(
+                            "Minecraft.Windows",
+                            StringComparison.OrdinalIgnoreCase) ||
+                        processName.Equals(
+                            "Minecraft",
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        AddDetectedGame(
+                            runningGames,
+                            "Minecraft",
+                            "Minecraft");
+
+                        continue;
+                    }
+
+                    // Minecraft Java Edition normally runs as javaw.exe.
+                    if (!processName.Equals(
+                            "javaw",
+                            StringComparison.OrdinalIgnoreCase) &&
+                        !processName.Equals(
+                            "java",
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    string? commandLine =
+                        TryGetProcessCommandLine(
+                            process);
+
+                    if (!LooksLikeMinecraftCommandLine(
+                        commandLine))
+                    {
+                        continue;
+                    }
+
+                    string? gameDirectory =
+                        ExtractMinecraftGameDirectory(
+                            commandLine!);
+
+                    (string gameName, string launcher) =
+                        GetMinecraftIdentity(
+                            gameDirectory,
+                            fallbackLauncher);
+
+                    AddDetectedGame(
+                        runningGames,
+                        gameName,
+                        launcher);
+                }
+                catch
+                {
+                }
+                finally
+                {
+                    process.Dispose();
+                }
+            }
+        }
+
+        private void AddDetectedGame(
+            HashSet<string> runningGames,
+            string gameName,
+            string launcher)
+        {
+            runningGames.Add(
+                gameName);
+
+            detectedLauncherOverrides[gameName] =
+                launcher;
+        }
+
+        private static string DetectRunningMinecraftLauncher(
+            IEnumerable<Process> processes)
+        {
+            foreach (Process process in processes)
+            {
+                try
+                {
+                    string name =
+                        process.ProcessName;
+
+                    if (name.Contains(
+                            "CurseForge",
+                            StringComparison.OrdinalIgnoreCase) ||
+                        name.Equals(
+                            "Overwolf",
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        return "CurseForge";
+                    }
+
+                    if (name.Contains(
+                        "PrismLauncher",
+                        StringComparison.OrdinalIgnoreCase))
+                    {
+                        return "Prism";
+                    }
+
+                    if (name.Contains(
+                            "Modrinth",
+                            StringComparison.OrdinalIgnoreCase) ||
+                        name.Contains(
+                            "Theseus",
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        return "Modrinth";
+                    }
+
+                    if (name.Contains(
+                        "ATLauncher",
+                        StringComparison.OrdinalIgnoreCase))
+                    {
+                        return "ATLauncher";
+                    }
+
+                    if (name.Contains(
+                            "GDLauncher",
+                            StringComparison.OrdinalIgnoreCase) ||
+                        name.Contains(
+                            "gdlauncher",
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        return "GDLauncher";
+                    }
+
+                    if (name.Contains(
+                        "MultiMC",
+                        StringComparison.OrdinalIgnoreCase))
+                    {
+                        return "MultiMC";
+                    }
+
+                    if (name.Contains(
+                            "MinecraftLauncher",
+                            StringComparison.OrdinalIgnoreCase) ||
+                        name.Contains(
+                            "Minecraft Launcher",
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        return "Minecraft";
+                    }
+                }
+                catch
+                {
+                }
+            }
+
+            return "Minecraft";
+        }
+
+        private static bool LooksLikeMinecraftCommandLine(
+            string? commandLine)
+        {
+            if (string.IsNullOrWhiteSpace(
+                commandLine))
+            {
+                return false;
+            }
+
+            return
+                commandLine.Contains(
+                    "minecraft",
+                    StringComparison.OrdinalIgnoreCase) ||
+                commandLine.Contains(
+                    "mojang",
+                    StringComparison.OrdinalIgnoreCase) ||
+                commandLine.Contains(
+                    "--gameDir",
+                    StringComparison.OrdinalIgnoreCase) ||
+                commandLine.Contains(
+                    "fabricmc",
+                    StringComparison.OrdinalIgnoreCase) ||
+                commandLine.Contains(
+                    "neoforge",
+                    StringComparison.OrdinalIgnoreCase) ||
+                commandLine.Contains(
+                    "modlauncher",
+                    StringComparison.OrdinalIgnoreCase) ||
+                commandLine.Contains(
+                    "--launchTarget",
+                    StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string? ExtractMinecraftGameDirectory(
+            string commandLine)
+        {
+            Match gameDirMatch =
+                Regex.Match(
+                    commandLine,
+                    "(?:--gameDir|--gameDirectory)(?:=|\\s+)(?:\\\"(?<path>[^\\\"]+)\\\"|(?<path>\\S+))",
+                    RegexOptions.IgnoreCase);
+
+            if (!gameDirMatch.Success)
+            {
+                return null;
+            }
+
+            string gameDirectory =
+                gameDirMatch
+                    .Groups["path"]
+                    .Value
+                    .Trim();
+
+            if (string.IsNullOrWhiteSpace(
+                gameDirectory))
+            {
+                return null;
+            }
+
+            return gameDirectory;
+        }
+
+        private static (string GameName, string Launcher) GetMinecraftIdentity(
+            string? gameDirectory,
+            string fallbackLauncher)
+        {
+            if (string.IsNullOrWhiteSpace(
+                gameDirectory))
+            {
+                return (
+                    "Minecraft",
+                    fallbackLauncher);
+            }
+
+            string normalizedPath =
+                gameDirectory
+                    .Replace('/', '\\')
+                    .TrimEnd('\\');
+
+            string? instanceName;
+
+            instanceName =
+                GetPathSegmentAfterMarker(
+                    normalizedPath,
+                    "\\curseforge\\minecraft\\Instances\\");
+
+            if (!string.IsNullOrWhiteSpace(
+                instanceName))
+            {
+                return (
+                    BuildMinecraftDisplayName(
+                        instanceName),
+                    "CurseForge");
+            }
+
+            instanceName =
+                GetPathSegmentAfterMarker(
+                    normalizedPath,
+                    "\\PrismLauncher\\instances\\");
+
+            if (!string.IsNullOrWhiteSpace(
+                instanceName))
+            {
+                return (
+                    BuildMinecraftDisplayName(
+                        instanceName),
+                    "Prism");
+            }
+
+            instanceName =
+                GetPathSegmentAfterMarker(
+                    normalizedPath,
+                    "\\MultiMC\\instances\\");
+
+            if (!string.IsNullOrWhiteSpace(
+                instanceName))
+            {
+                return (
+                    BuildMinecraftDisplayName(
+                        instanceName),
+                    "MultiMC");
+            }
+
+            instanceName =
+                GetPathSegmentAfterMarker(
+                    normalizedPath,
+                    "\\ATLauncher\\instances\\");
+
+            if (!string.IsNullOrWhiteSpace(
+                instanceName))
+            {
+                return (
+                    BuildMinecraftDisplayName(
+                        instanceName),
+                    "ATLauncher");
+            }
+
+            instanceName =
+                GetPathSegmentAfterMarker(
+                    normalizedPath,
+                    "\\GDLauncher\\instances\\");
+
+            if (string.IsNullOrWhiteSpace(
+                instanceName))
+            {
+                instanceName =
+                    GetPathSegmentAfterMarker(
+                        normalizedPath,
+                        "\\gdlauncher_carbon\\data\\instances\\");
+            }
+
+            if (!string.IsNullOrWhiteSpace(
+                instanceName))
+            {
+                return (
+                    BuildMinecraftDisplayName(
+                        instanceName),
+                    "GDLauncher");
+            }
+
+            instanceName =
+                GetPathSegmentAfterMarker(
+                    normalizedPath,
+                    "\\com.modrinth.theseus\\profiles\\");
+
+            if (string.IsNullOrWhiteSpace(
+                instanceName))
+            {
+                instanceName =
+                    GetPathSegmentAfterMarker(
+                        normalizedPath,
+                        "\\ModrinthApp\\profiles\\");
+            }
+
+            if (!string.IsNullOrWhiteSpace(
+                instanceName))
+            {
+                return (
+                    BuildMinecraftDisplayName(
+                        instanceName),
+                    "Modrinth");
+            }
+
+            // The normal official Java install usually points at .minecraft.
+            if (normalizedPath.EndsWith(
+                    "\\.minecraft",
+                    StringComparison.OrdinalIgnoreCase) ||
+                normalizedPath.Contains(
+                    "\\.minecraft\\",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return (
+                    "Minecraft",
+                    "Minecraft");
+            }
+
+            // A custom game directory may still belong to a modded launcher.
+            // Use the folder name as the instance name only when we already
+            // recognized a non-default launcher process.
+            if (!fallbackLauncher.Equals(
+                    "Minecraft",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                string folderName =
+                    new DirectoryInfo(
+                            normalizedPath)
+                        .Name;
+
+                if (IsUsefulMinecraftInstanceName(
+                    folderName))
+                {
+                    return (
+                        BuildMinecraftDisplayName(
+                            folderName),
+                        fallbackLauncher);
+                }
+            }
+
+            return (
+                "Minecraft",
+                fallbackLauncher);
+        }
+
+        private static string? GetPathSegmentAfterMarker(
+            string path,
+            string marker)
+        {
+            int markerIndex =
+                path.IndexOf(
+                    marker,
+                    StringComparison.OrdinalIgnoreCase);
+
+            if (markerIndex < 0)
+            {
+                return null;
+            }
+
+            int startIndex =
+                markerIndex + marker.Length;
+
+            if (startIndex >= path.Length)
+            {
+                return null;
+            }
+
+            string remaining =
+                path[startIndex..]
+                    .TrimStart('\\');
+
+            int separatorIndex =
+                remaining.IndexOf('\\');
+
+            string instanceName =
+                separatorIndex >= 0
+                    ? remaining[..separatorIndex]
+                    : remaining;
+
+            return IsUsefulMinecraftInstanceName(
+                    instanceName)
+                ? instanceName
+                : null;
+        }
+
+        private static bool IsUsefulMinecraftInstanceName(
+            string? instanceName)
+        {
+            if (string.IsNullOrWhiteSpace(
+                instanceName))
+            {
+                return false;
+            }
+
+            string trimmed =
+                instanceName.Trim();
+
+            return
+                !trimmed.Equals(
+                    ".minecraft",
+                    StringComparison.OrdinalIgnoreCase) &&
+                !trimmed.Equals(
+                    "minecraft",
+                    StringComparison.OrdinalIgnoreCase) &&
+                !trimmed.Equals(
+                    "instances",
+                    StringComparison.OrdinalIgnoreCase) &&
+                !trimmed.Equals(
+                    "profiles",
+                    StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string BuildMinecraftDisplayName(
+            string instanceName)
+        {
+            string cleanedInstanceName =
+                instanceName
+                    .Replace('_', ' ')
+                    .Trim();
+
+            return
+                $"Minecraft - {cleanedInstanceName}";
+        }
+
+        private static string? TryGetProcessCommandLine(
+            Process process)
+        {
+            if (!OperatingSystem.IsWindows())
+            {
+                return null;
+            }
+
+            const int processCommandLineInformation =
+                60;
+
+            IntPtr buffer =
+                IntPtr.Zero;
+
+            try
+            {
+                _ = NtQueryInformationProcess(
+                    process.Handle,
+                    processCommandLineInformation,
+                    IntPtr.Zero,
+                    0,
+                    out int requiredLength);
+
+                if (requiredLength <= 0)
+                {
+                    return null;
+                }
+
+                buffer =
+                    Marshal.AllocHGlobal(
+                        requiredLength);
+
+                int status =
+                    NtQueryInformationProcess(
+                        process.Handle,
+                        processCommandLineInformation,
+                        buffer,
+                        requiredLength,
+                        out _);
+
+                if (status != 0)
+                {
+                    return null;
+                }
+
+                ushort stringLength =
+                    unchecked(
+                        (ushort)Marshal.ReadInt16(
+                            buffer,
+                            0));
+
+                if (stringLength == 0)
+                {
+                    return string.Empty;
+                }
+
+                int pointerOffset =
+                    IntPtr.Size == 8
+                        ? 8
+                        : 4;
+
+                IntPtr stringPointer =
+                    Marshal.ReadIntPtr(
+                        buffer,
+                        pointerOffset);
+
+                if (stringPointer == IntPtr.Zero)
+                {
+                    return null;
+                }
+
+                return Marshal.PtrToStringUni(
+                    stringPointer,
+                    stringLength / 2);
+            }
+            catch
+            {
+                return null;
+            }
+            finally
+            {
+                if (buffer != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(
+                        buffer);
+                }
+            }
+        }
+
+        [DllImport("ntdll.dll")]
+        private static extern int NtQueryInformationProcess(
+            IntPtr processHandle,
+            int processInformationClass,
+            IntPtr processInformation,
+            int processInformationLength,
+            out int returnLength);
+
+        // =========================================================
         // EA APP
         // =========================================================
 
@@ -1431,6 +2030,18 @@ namespace GameWatchService
                 "upc",
                 "UplayWebCore",
                 "UplayService",
+
+                // Minecraft launchers / helpers
+                "MinecraftLauncher",
+                "CurseForge",
+                "Overwolf",
+                "PrismLauncher",
+                "Modrinth App",
+                "ModrinthApp",
+                "Theseus",
+                "ATLauncher",
+                "GDLauncher",
+                "MultiMC",
 
                 // Installers
                 "installscript",
