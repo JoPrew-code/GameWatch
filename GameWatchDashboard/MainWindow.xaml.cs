@@ -40,7 +40,7 @@ namespace GameWatchDashboard
             "GameWatchDashboard";
 
         private const string CurrentVersion =
-            "1.0.0";
+            "1.1.0";
 
         private const string GitHubLatestReleaseApi =
             "https://api.github.com/repos/JoPrew-code/GameWatch/releases/latest";

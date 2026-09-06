@@ -2,6 +2,8 @@ using System.Diagnostics;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Runtime.InteropServices;
+using System.Net.Http;
+using System.Xml.Linq;
 using Microsoft.Data.Sqlite;
 using Microsoft.Win32;
 
@@ -14,6 +16,62 @@ namespace GameWatchService
 
         private List<InstalledGame> installedGames = new();
 
+        // Xbox / PC Game Pass games can start a bootstrap executable from
+        // MicrosoftGame.config and then hand off to another gameplay EXE
+        // deeper in the Content folder (for example *-WinGDK-Shipping.exe).
+        // Cache every executable name found under each Xbox game's Content
+        // folder so detection still works even when Windows blocks access to
+        // Process.MainModule for a packaged/GDK process.
+        private static readonly Dictionary<string, HashSet<string>> xboxExecutableNamesByInstallPath =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        private static bool IsSharedXboxHelperProcess(
+            string processName)
+        {
+            if (string.IsNullOrWhiteSpace(
+                processName))
+            {
+                return true;
+            }
+
+            string normalized =
+                processName.Trim();
+
+            string[] sharedHelpers =
+            {
+                "gamelaunchhelper",
+                "GamingServices",
+                "GamingServicesNet",
+                "XboxPcApp",
+                "XboxPcTray",
+                "XboxGameBar",
+                "GameBar",
+                "GameBarFTServer",
+                "GameBarPresenceWriter",
+                "Microsoft.GamingApp",
+                "EasyAntiCheat",
+                "EasyAntiCheat_EOS",
+                "EasyAntiCheat_EOS_Setup",
+                "BEService",
+                "BEService_x64",
+                "CrashReportClient",
+                "UnrealCEFSubProcess",
+                "RobloxCrashHandler"
+            };
+
+            return sharedHelpers.Any(
+                helper =>
+                    normalized.Equals(
+                        helper,
+                        StringComparison.OrdinalIgnoreCase) ||
+                    normalized.StartsWith(
+                        helper + "-",
+                        StringComparison.OrdinalIgnoreCase) ||
+                    normalized.StartsWith(
+                        helper + "_",
+                        StringComparison.OrdinalIgnoreCase));
+        }
+
         private DateTime lastGameRefresh =
             DateTime.MinValue;
 
@@ -25,6 +83,24 @@ namespace GameWatchService
         // process can come from several different launchers.
         private readonly Dictionary<string, string> detectedLauncherOverrides =
             new(StringComparer.OrdinalIgnoreCase);
+
+        // Roblox integration state. Roblox writes the current place/universe
+        // information into its local player log while an experience is open.
+        private static readonly HttpClient robloxHttpClient =
+            new()
+            {
+                Timeout = TimeSpan.FromSeconds(5)
+            };
+
+        private readonly Dictionary<long, string> robloxExperienceNameCache =
+            new();
+
+        private string? robloxCurrentLogPath;
+        private long robloxCurrentLogPosition;
+        private long? robloxCurrentPlaceId;
+        private long? robloxCurrentUniverseId;
+        private string? robloxCurrentGameName;
+        private DateTime robloxLastResolveAttempt = DateTime.MinValue;
 
         // Apps that should never count as games.
         private static readonly HashSet<string> IgnoredGameNames =
@@ -108,6 +184,9 @@ namespace GameWatchService
                 DetectMinecraftProcesses(
                     runningGames);
 
+                DetectRobloxProcesses(
+                    runningGames);
+
                 LoadManualGames(
                     runningGames);
 
@@ -145,12 +224,16 @@ namespace GameWatchService
             List<InstalledGame> ubisoftGames =
                 LoadUbisoftGames();
 
+            List<InstalledGame> xboxGames =
+                LoadXboxGames();
+
             installedGames =
                 steamGames
                     .Concat(epicGames)
                     .Concat(riotGames)
                     .Concat(eaGames)
                     .Concat(ubisoftGames)
+                    .Concat(xboxGames)
                     .Where(
                         g => !IgnoredGameNames.Contains(
                             g.Name))
@@ -167,12 +250,13 @@ namespace GameWatchService
             logger.LogInformation(
                 "Game libraries refreshed. " +
                 "Steam: {steam}, Epic: {epic}, Riot: {riot}, " +
-                "EA: {ea}, Ubisoft: {ubisoft}",
+                "EA: {ea}, Ubisoft: {ubisoft}, Xbox: {xbox}",
                 steamGames.Count,
                 epicGames.Count,
                 riotGames.Count,
                 eaGames.Count,
-                ubisoftGames.Count);
+                ubisoftGames.Count,
+                xboxGames.Count);
         }
 
         // =========================================================
@@ -1483,6 +1567,525 @@ namespace GameWatchService
             out int returnLength);
 
         // =========================================================
+        // ROBLOX
+        // =========================================================
+
+        private void DetectRobloxProcesses(
+            HashSet<string> runningGames)
+        {
+            Process[] processes =
+                Process.GetProcesses();
+
+            Process? robloxProcess =
+                null;
+
+            try
+            {
+                foreach (Process process in processes)
+                {
+                    try
+                    {
+                        string processName =
+                            process.ProcessName;
+
+                        if (IsRobloxPlayerProcess(
+                            processName))
+                        {
+                            robloxProcess =
+                                process;
+
+                            break;
+                        }
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                if (robloxProcess == null)
+                {
+                    ResetRobloxTrackingState();
+                    return;
+                }
+
+                string? logDirectory =
+                    FindRobloxLogDirectory(
+                        robloxProcess);
+
+                if (!string.IsNullOrWhiteSpace(
+                        logDirectory))
+                {
+                    UpdateRobloxStateFromLogs(
+                        logDirectory);
+                }
+
+                // If the log tells us which experience is open, use its
+                // real Roblox title. If Roblox is running but the log is
+                // temporarily unavailable, still track it as Roblox.
+                string gameName =
+                    robloxCurrentGameName ??
+                    "Roblox";
+
+                AddDetectedGame(
+                    runningGames,
+                    gameName,
+                    "Roblox");
+            }
+            finally
+            {
+                foreach (Process process in processes)
+                {
+                    process.Dispose();
+                }
+            }
+        }
+
+        private static bool IsRobloxPlayerProcess(
+            string processName)
+        {
+            return
+                processName.Equals(
+                    "RobloxPlayerBeta",
+                    StringComparison.OrdinalIgnoreCase) ||
+                processName.Equals(
+                    "RobloxPlayer",
+                    StringComparison.OrdinalIgnoreCase) ||
+                processName.Equals(
+                    "Windows10Universal",
+                    StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string? FindRobloxLogDirectory(
+            Process robloxProcess)
+        {
+            try
+            {
+                string? executablePath =
+                    robloxProcess.MainModule
+                        ?.FileName;
+
+                if (!string.IsNullOrWhiteSpace(
+                        executablePath))
+                {
+                    Match userProfileMatch =
+                        Regex.Match(
+                            executablePath,
+                            @"^([A-Za-z]:\\Users\\[^\\]+)\\",
+                            RegexOptions.IgnoreCase);
+
+                    if (userProfileMatch.Success)
+                    {
+                        string candidate =
+                            Path.Combine(
+                                userProfileMatch.Groups[1].Value,
+                                "AppData",
+                                "Local",
+                                "Roblox",
+                                "logs");
+
+                        if (Directory.Exists(
+                            candidate))
+                        {
+                            return candidate;
+                        }
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            // Fallback for unusual Roblox/Bloxstrap install locations.
+            // The Windows service runs as LocalSystem, so LocalApplicationData
+            // is not the signed-in player's AppData. Search normal user
+            // profiles instead.
+            try
+            {
+                string usersRoot =
+                    Path.Combine(
+                        Path.GetPathRoot(
+                            Environment.SystemDirectory) ??
+                            @"C:\",
+                        "Users");
+
+                if (!Directory.Exists(
+                    usersRoot))
+                {
+                    return null;
+                }
+
+                return Directory
+                    .GetDirectories(
+                        usersRoot)
+                    .Select(
+                        profile =>
+                            Path.Combine(
+                                profile,
+                                "AppData",
+                                "Local",
+                                "Roblox",
+                                "logs"))
+                    .Where(
+                        Directory.Exists)
+                    .OrderByDescending(
+                        GetNewestRobloxLogWriteTime)
+                    .FirstOrDefault();
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static DateTime GetNewestRobloxLogWriteTime(
+            string logDirectory)
+        {
+            try
+            {
+                FileInfo? newest =
+                    new DirectoryInfo(
+                        logDirectory)
+                    .GetFiles()
+                    .Where(
+                        file =>
+                            file.Name.Contains(
+                                "Player",
+                                StringComparison.OrdinalIgnoreCase))
+                    .OrderByDescending(
+                        file => file.LastWriteTimeUtc)
+                    .FirstOrDefault();
+
+                return newest?.LastWriteTimeUtc ??
+                    DateTime.MinValue;
+            }
+            catch
+            {
+                return DateTime.MinValue;
+            }
+        }
+
+        private void UpdateRobloxStateFromLogs(
+            string logDirectory)
+        {
+            FileInfo? newestLog;
+
+            try
+            {
+                newestLog =
+                    new DirectoryInfo(
+                        logDirectory)
+                    .GetFiles()
+                    .Where(
+                        file =>
+                            file.Name.Contains(
+                                "Player",
+                                StringComparison.OrdinalIgnoreCase))
+                    .OrderByDescending(
+                        file => file.CreationTimeUtc)
+                    .FirstOrDefault();
+            }
+            catch
+            {
+                return;
+            }
+
+            if (newestLog == null)
+            {
+                return;
+            }
+
+            if (!string.Equals(
+                    robloxCurrentLogPath,
+                    newestLog.FullName,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                robloxCurrentLogPath =
+                    newestLog.FullName;
+
+                robloxCurrentLogPosition =
+                    0;
+
+                robloxCurrentPlaceId =
+                    null;
+
+                robloxCurrentUniverseId =
+                    null;
+
+                robloxCurrentGameName =
+                    null;
+            }
+
+            try
+            {
+                using FileStream stream =
+                    new(
+                        newestLog.FullName,
+                        FileMode.Open,
+                        FileAccess.Read,
+                        FileShare.ReadWrite | FileShare.Delete);
+
+                if (robloxCurrentLogPosition >
+                    stream.Length)
+                {
+                    robloxCurrentLogPosition =
+                        0;
+                }
+
+                stream.Seek(
+                    robloxCurrentLogPosition,
+                    SeekOrigin.Begin);
+
+                using StreamReader reader =
+                    new(
+                        stream,
+                        leaveOpen: true);
+
+                string? line;
+
+                while ((line = reader.ReadLine()) != null)
+                {
+                    ParseRobloxLogLine(
+                        line);
+                }
+
+                robloxCurrentLogPosition =
+                    stream.Position;
+            }
+            catch
+            {
+                return;
+            }
+
+            ResolveCurrentRobloxExperienceName();
+        }
+
+        private void ParseRobloxLogLine(
+            string line)
+        {
+            Match joiningMatch =
+                Regex.Match(
+                    line,
+                    @"! Joining game '[0-9a-f\-]{36}' place ([0-9]+) at ",
+                    RegexOptions.IgnoreCase);
+
+            if (joiningMatch.Success &&
+                long.TryParse(
+                    joiningMatch.Groups[1].Value,
+                    out long placeId))
+            {
+                robloxCurrentPlaceId =
+                    placeId;
+
+                robloxCurrentUniverseId =
+                    null;
+
+                robloxCurrentGameName =
+                    null;
+
+                robloxLastResolveAttempt =
+                    DateTime.MinValue;
+
+                return;
+            }
+
+            Match universeMatch =
+                Regex.Match(
+                    line,
+                    @"universeid:([0-9]+)",
+                    RegexOptions.IgnoreCase);
+
+            if (universeMatch.Success &&
+                long.TryParse(
+                    universeMatch.Groups[1].Value,
+                    out long universeId))
+            {
+                robloxCurrentUniverseId =
+                    universeId;
+
+                robloxLastResolveAttempt =
+                    DateTime.MinValue;
+            }
+
+            if (line.Contains(
+                    "[FLog::Network] Time to disconnect replication data:",
+                    StringComparison.OrdinalIgnoreCase) ||
+                line.Contains(
+                    "[FLog::SingleSurfaceApp] leaveUGCGameInternal",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                robloxCurrentPlaceId =
+                    null;
+
+                robloxCurrentUniverseId =
+                    null;
+
+                robloxCurrentGameName =
+                    null;
+            }
+        }
+
+        private void ResolveCurrentRobloxExperienceName()
+        {
+            if (!robloxCurrentPlaceId.HasValue)
+            {
+                return;
+            }
+
+            if (robloxCurrentGameName != null)
+            {
+                return;
+            }
+
+            if ((DateTime.Now - robloxLastResolveAttempt)
+                .TotalSeconds < 30)
+            {
+                return;
+            }
+
+            robloxLastResolveAttempt =
+                DateTime.Now;
+
+            try
+            {
+                long? universeId =
+                    robloxCurrentUniverseId;
+
+                if (!universeId.HasValue)
+                {
+                    string universeJson =
+                        robloxHttpClient
+                            .GetStringAsync(
+                                $"https://apis.roblox.com/universes/v1/places/{robloxCurrentPlaceId.Value}/universe")
+                            .GetAwaiter()
+                            .GetResult();
+
+                    using JsonDocument universeDocument =
+                        JsonDocument.Parse(
+                            universeJson);
+
+                    if (universeDocument.RootElement.TryGetProperty(
+                            "universeId",
+                            out JsonElement universeElement) &&
+                        universeElement.TryGetInt64(
+                            out long resolvedUniverseId))
+                    {
+                        universeId =
+                            resolvedUniverseId;
+
+                        robloxCurrentUniverseId =
+                            resolvedUniverseId;
+                    }
+                }
+
+                if (!universeId.HasValue)
+                {
+                    return;
+                }
+
+                if (robloxExperienceNameCache.TryGetValue(
+                        universeId.Value,
+                        out string? cachedName))
+                {
+                    robloxCurrentGameName =
+                        BuildRobloxDisplayName(
+                            cachedName);
+
+                    return;
+                }
+
+                string gameJson =
+                    robloxHttpClient
+                        .GetStringAsync(
+                            $"https://games.roblox.com/v1/games?universeIds={universeId.Value}")
+                        .GetAwaiter()
+                        .GetResult();
+
+                using JsonDocument gameDocument =
+                    JsonDocument.Parse(
+                        gameJson);
+
+                if (!gameDocument.RootElement.TryGetProperty(
+                        "data",
+                        out JsonElement dataElement) ||
+                    dataElement.ValueKind != JsonValueKind.Array ||
+                    dataElement.GetArrayLength() == 0)
+                {
+                    return;
+                }
+
+                JsonElement firstGame =
+                    dataElement[0];
+
+                if (!firstGame.TryGetProperty(
+                        "name",
+                        out JsonElement nameElement))
+                {
+                    return;
+                }
+
+                string? experienceName =
+                    nameElement.GetString();
+
+                if (string.IsNullOrWhiteSpace(
+                    experienceName))
+                {
+                    return;
+                }
+
+                robloxExperienceNameCache[universeId.Value] =
+                    experienceName;
+
+                robloxCurrentGameName =
+                    BuildRobloxDisplayName(
+                        experienceName);
+            }
+            catch (Exception ex)
+            {
+                logger.LogDebug(
+                    ex,
+                    "Could not resolve Roblox experience name.");
+            }
+        }
+
+        private static string BuildRobloxDisplayName(
+            string experienceName)
+        {
+            string cleanedName =
+                experienceName.Trim();
+
+            if (cleanedName.StartsWith(
+                    "Roblox - ",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return cleanedName;
+            }
+
+            return
+                $"Roblox - {cleanedName}";
+        }
+
+        private void ResetRobloxTrackingState()
+        {
+            robloxCurrentLogPath =
+                null;
+
+            robloxCurrentLogPosition =
+                0;
+
+            robloxCurrentPlaceId =
+                null;
+
+            robloxCurrentUniverseId =
+                null;
+
+            robloxCurrentGameName =
+                null;
+
+            robloxLastResolveAttempt =
+                DateTime.MinValue;
+        }
+
+        // =========================================================
         // EA APP
         // =========================================================
 
@@ -1630,6 +2233,250 @@ namespace GameWatchService
                 .Select(
                     g => g.First())
                 .ToList();
+        }
+
+        // =========================================================
+        // XBOX APP / MICROSOFT STORE (GDK)
+        // =========================================================
+
+        private static List<InstalledGame> LoadXboxGames()
+        {
+            List<InstalledGame> games =
+                new();
+
+            xboxExecutableNamesByInstallPath.Clear();
+
+            foreach (DriveInfo drive in DriveInfo.GetDrives())
+            {
+                try
+                {
+                    if (!drive.IsReady)
+                    {
+                        continue;
+                    }
+
+                    string xboxRoot =
+                        Path.Combine(
+                            drive.RootDirectory.FullName,
+                            "XboxGames");
+
+                    if (!Directory.Exists(
+                        xboxRoot))
+                    {
+                        continue;
+                    }
+
+                    foreach (string gameFolder
+                        in Directory.GetDirectories(
+                            xboxRoot))
+                    {
+                        string contentFolder =
+                            Path.Combine(
+                                gameFolder,
+                                "Content");
+
+                        string configPath =
+                            Path.Combine(
+                                contentFolder,
+                                "MicrosoftGame.config");
+
+                        if (!File.Exists(
+                            configPath))
+                        {
+                            continue;
+                        }
+
+                        TryAddXboxGameFromConfig(
+                            games,
+                            contentFolder,
+                            configPath);
+
+                        CacheXboxExecutableNames(
+                            contentFolder);
+                    }
+                }
+                catch
+                {
+                }
+            }
+
+            return games
+                .Where(
+                    g => !IgnoredGameNames.Contains(
+                        g.Name))
+                .GroupBy(
+                    g => g.ExecutablePath ?? g.InstallPath,
+                    StringComparer.OrdinalIgnoreCase)
+                .Select(
+                    g => g.First())
+                .ToList();
+        }
+
+        private static void TryAddXboxGameFromConfig(
+            List<InstalledGame> games,
+            string contentFolder,
+            string configPath)
+        {
+            try
+            {
+                XDocument document =
+                    XDocument.Load(
+                        configPath);
+
+                XElement? root =
+                    document.Root;
+
+                if (root == null)
+                {
+                    return;
+                }
+
+                XElement? shellVisuals =
+                    root.Element(
+                        "ShellVisuals");
+
+                string? displayName =
+                    shellVisuals?
+                        .Attribute(
+                            "DefaultDisplayName")
+                        ?.Value;
+
+                if (string.IsNullOrWhiteSpace(
+                    displayName))
+                {
+                    displayName =
+                        new DirectoryInfo(
+                            Directory.GetParent(
+                                contentFolder)!
+                                .FullName)
+                            .Name;
+                }
+
+                // Add the Xbox game from the install root even if the
+                // executable listed in MicrosoftGame.config is only a
+                // bootstrap/logical entry and does not physically exist.
+                // The running-game detector can still identify any real
+                // gameplay EXE found underneath this Content folder.
+                string? preferredExecutablePath = null;
+
+                XElement? executableList =
+                    root.Element(
+                        "ExecutableList");
+
+                if (executableList != null)
+                {
+                    foreach (XElement executableElement
+                        in executableList.Elements(
+                            "Executable"))
+                    {
+                        string? relativeExecutablePath =
+                            executableElement
+                                .Attribute(
+                                    "Name")
+                                ?.Value;
+
+                        if (string.IsNullOrWhiteSpace(
+                            relativeExecutablePath))
+                        {
+                            continue;
+                        }
+
+                        string fullExecutablePath =
+                            Path.GetFullPath(
+                                Path.Combine(
+                                    contentFolder,
+                                    relativeExecutablePath
+                                        .Replace('/', Path.DirectorySeparatorChar)
+                                        .Replace('\\', Path.DirectorySeparatorChar)));
+
+                        if (File.Exists(
+                            fullExecutablePath))
+                        {
+                            preferredExecutablePath =
+                                fullExecutablePath;
+
+                            break;
+                        }
+                    }
+                }
+
+                games.Add(
+                    new InstalledGame(
+                        displayName,
+                        contentFolder,
+                        "Xbox",
+                        preferredExecutablePath));
+
+            }
+            catch
+            {
+            }
+        }
+
+        private static void CacheXboxExecutableNames(
+            string contentFolder)
+        {
+            HashSet<string> executableNames =
+                new(StringComparer.OrdinalIgnoreCase);
+
+            Stack<string> folders =
+                new();
+
+            folders.Push(
+                contentFolder);
+
+            while (folders.Count > 0)
+            {
+                string currentFolder =
+                    folders.Pop();
+
+                try
+                {
+                    foreach (string executablePath
+                        in Directory.EnumerateFiles(
+                            currentFolder,
+                            "*.exe",
+                            SearchOption.TopDirectoryOnly))
+                    {
+                        string executableName =
+                            Path.GetFileNameWithoutExtension(
+                                executablePath);
+
+                        if (!string.IsNullOrWhiteSpace(
+                                executableName) &&
+                            !ShouldIgnoreProcess(
+                                executableName) &&
+                            !IsSharedXboxHelperProcess(
+                                executableName))
+                        {
+                            executableNames.Add(
+                                executableName);
+                        }
+                    }
+                }
+                catch
+                {
+                }
+
+                try
+                {
+                    foreach (string childFolder
+                        in Directory.EnumerateDirectories(
+                            currentFolder))
+                    {
+                        folders.Push(
+                            childFolder);
+                    }
+                }
+                catch
+                {
+                }
+            }
+
+            xboxExecutableNamesByInstallPath[
+                Path.GetFullPath(
+                    contentFolder)] = executableNames;
+
         }
 
         // =========================================================
@@ -1842,45 +2689,142 @@ namespace GameWatchService
             {
                 try
                 {
-                    string? executablePath =
-                        process.MainModule
-                            ?.FileName;
+                    string processName;
 
-                    if (string.IsNullOrWhiteSpace(
-                        executablePath))
+                    try
+                    {
+                        processName =
+                            process.ProcessName;
+                    }
+                    catch
                     {
                         continue;
+                    }
+
+                    if (string.IsNullOrWhiteSpace(
+                            processName) ||
+                        ShouldIgnoreProcess(
+                            processName) ||
+                        IsSharedXboxHelperProcess(
+                            processName))
+                    {
+                        continue;
+                    }
+
+                    // Some Xbox/GDK processes do not allow a Windows service
+                    // to read MainModule.FileName. Keep this optional so Xbox
+                    // detection can fall back to the cached executable name.
+                    string? executablePath = null;
+
+                    try
+                    {
+                        executablePath =
+                            process.MainModule
+                                ?.FileName;
+                    }
+                    catch
+                    {
                     }
 
                     foreach (InstalledGame game
                         in games)
                     {
-                        string gameFolder =
-                            Path.GetFullPath(
-                                    game.InstallPath)
-                                .TrimEnd(
-                                    Path.DirectorySeparatorChar,
-                                    Path.AltDirectorySeparatorChar)
-                            +
-                            Path.DirectorySeparatorChar;
+                        bool executableMatches = false;
 
-                        if (!executablePath.StartsWith(
-                            gameFolder,
-                            StringComparison.OrdinalIgnoreCase))
+                        if (game.Launcher.Equals(
+                                "Xbox",
+                                StringComparison.OrdinalIgnoreCase))
+                        {
+                            string normalizedInstallPath =
+                                Path.GetFullPath(
+                                    game.InstallPath);
+
+                            // Best case: we can read the real process path and
+                            // verify that it lives anywhere under this game's
+                            // Content folder. This catches nested Shipping EXEs.
+                            if (!string.IsNullOrWhiteSpace(
+                                    executablePath))
+                            {
+                                string gameFolder =
+                                    normalizedInstallPath
+                                        .TrimEnd(
+                                            Path.DirectorySeparatorChar,
+                                            Path.AltDirectorySeparatorChar)
+                                    +
+                                    Path.DirectorySeparatorChar;
+
+                                try
+                                {
+                                    executableMatches =
+                                        Path.GetFullPath(
+                                                executablePath)
+                                            .StartsWith(
+                                                gameFolder,
+                                                StringComparison.OrdinalIgnoreCase);
+                                }
+                                catch
+                                {
+                                }
+                            }
+
+                            // Fallback for protected/packaged GDK processes:
+                            // match ProcessName against every EXE discovered
+                            // underneath this game's Content folder at refresh.
+                            if (!executableMatches &&
+                                xboxExecutableNamesByInstallPath.TryGetValue(
+                                    normalizedInstallPath,
+                                    out HashSet<string>? xboxExecutableNames))
+                            {
+                                executableMatches =
+                                    xboxExecutableNames.Contains(
+                                        processName);
+
+                            }
+                        }
+                        else
+                        {
+                            if (string.IsNullOrWhiteSpace(
+                                executablePath))
+                            {
+                                continue;
+                            }
+
+                            if (!string.IsNullOrWhiteSpace(
+                                game.ExecutablePath))
+                            {
+                                executableMatches =
+                                    Path.GetFullPath(
+                                            executablePath)
+                                        .Equals(
+                                            Path.GetFullPath(
+                                                game.ExecutablePath),
+                                            StringComparison.OrdinalIgnoreCase);
+                            }
+                            else
+                            {
+                                string gameFolder =
+                                    Path.GetFullPath(
+                                            game.InstallPath)
+                                        .TrimEnd(
+                                            Path.DirectorySeparatorChar,
+                                            Path.AltDirectorySeparatorChar)
+                                    +
+                                    Path.DirectorySeparatorChar;
+
+                                executableMatches =
+                                    executablePath.StartsWith(
+                                        gameFolder,
+                                        StringComparison.OrdinalIgnoreCase);
+                            }
+                        }
+
+                        if (!executableMatches)
                         {
                             continue;
                         }
 
-                        string processName =
-                            Path.GetFileNameWithoutExtension(
-                                executablePath);
-
-                        if (!ShouldIgnoreProcess(
-                            processName))
-                        {
-                            runningGames.Add(
-                                game.Name);
-                        }
+                        runningGames.Add(
+                            game.Name);
 
                         break;
                     }
@@ -2043,6 +2987,16 @@ namespace GameWatchService
                 "GDLauncher",
                 "MultiMC",
 
+                // Xbox / GDK helpers and installers
+                "GamingServices",
+                "GamingServicesNet",
+                "GameBar",
+                "GameBarFTServer",
+                "XboxPcApp",
+                "XboxAppServices",
+                "MicrosoftGameUI",
+                "BootstrapPackagedGame",
+
                 // Installers
                 "installscript",
                 "vc_redist",
@@ -2133,6 +3087,7 @@ namespace GameWatchService
         private record InstalledGame(
             string Name,
             string InstallPath,
-            string Launcher);
+            string Launcher,
+            string? ExecutablePath = null);
     }
 }
