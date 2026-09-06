@@ -999,6 +999,97 @@
 
                     </Border>
 
+                    <!-- UPDATES -->
+                    <Border Background="#15191F"
+                            BorderBrush="#252A31"
+                            BorderThickness="1"
+                            CornerRadius="14"
+                            Padding="20"
+                            Margin="0,0,0,18">
+
+                        <StackPanel>
+
+                            <TextBlock Text="Updates"
+                                       Foreground="White"
+                                       FontSize="18"
+                                       FontWeight="Bold"/>
+
+                            <TextBlock Text="GameWatch checks your GitHub releases so you can install new versions without visiting the website."
+                                       Foreground="#8B94A5"
+                                       FontSize="12"
+                                       Margin="0,5,0,18"
+                                       TextWrapping="Wrap"/>
+
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="24"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+
+                                <StackPanel Grid.Column="0">
+                                    <TextBlock Text="CURRENT VERSION"
+                                               Foreground="#7C8597"
+                                               FontSize="11"/>
+                                    <TextBlock x:Name="SettingsCurrentVersionText"
+                                               Text="1.0.0"
+                                               Foreground="White"
+                                               FontSize="18"
+                                               FontWeight="Bold"
+                                               Margin="0,5,0,0"/>
+                                </StackPanel>
+
+                                <StackPanel Grid.Column="2">
+                                    <TextBlock Text="LATEST VERSION"
+                                               Foreground="#7C8597"
+                                               FontSize="11"/>
+                                    <TextBlock x:Name="SettingsLatestVersionText"
+                                               Text="Not checked yet"
+                                               Foreground="#7CFF6B"
+                                               FontSize="18"
+                                               FontWeight="Bold"
+                                               Margin="0,5,0,0"/>
+                                </StackPanel>
+                            </Grid>
+
+                            <StackPanel Orientation="Horizontal"
+                                        Margin="0,18,0,0">
+
+                                <Button x:Name="SettingsCheckForUpdatesButton"
+                                        Content="Check for Updates"
+                                        MinWidth="160"
+                                        Height="38"
+                                        Padding="16,0"
+                                        Background="#1D2621"
+                                        Foreground="#7CFF6B"
+                                        BorderBrush="#2F3B32"/>
+
+                                <Button x:Name="SettingsInstallUpdateButton"
+                                        Content="Download &amp; Install Update"
+                                        MinWidth="210"
+                                        Height="38"
+                                        Padding="16,0"
+                                        Margin="12,0,0,0"
+                                        Background="#7CFF6B"
+                                        Foreground="#0D0F12"
+                                        BorderBrush="#7CFF6B"
+                                        FontWeight="SemiBold"
+                                        Visibility="Collapsed"/>
+
+                            </StackPanel>
+
+                            <TextBlock x:Name="SettingsUpdateStatusText"
+                                       Text="GameWatch will check automatically when the dashboard starts."
+                                       Foreground="#8B94A5"
+                                       FontSize="12"
+                                       Margin="0,12,0,0"
+                                       TextWrapping="Wrap"/>
+
+                        </StackPanel>
+
+                    </Border>
+
                     <!-- DATA AND LOGS -->
                     <Border Background="#15191F"
                             BorderBrush="#252A31"
@@ -1089,7 +1180,8 @@
                                        Foreground="#8B94A5"
                                        Margin="0,5,0,0"/>
 
-                            <TextBlock Text="Dashboard Version 1.0"
+                            <TextBlock x:Name="SettingsAboutVersionText"
+                                       Text="Dashboard Version 1.0.0"
                                        Foreground="#D3D7DE"
                                        Margin="0,14,0,0"/>
 

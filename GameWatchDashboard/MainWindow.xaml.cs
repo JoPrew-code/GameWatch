@@ -7,6 +7,8 @@ using System.IO;
 using System.Diagnostics;
 using System.Text.Json;
 using System.Linq;
+using System.Net.Http;
+using System.Threading.Tasks;
 using System.ComponentModel;
 using System.Windows;
 using System.Windows.Controls;
@@ -36,6 +38,17 @@ namespace GameWatchDashboard
 
         private const string StartupValueName =
             "GameWatchDashboard";
+
+        private const string CurrentVersion =
+            "1.0.0";
+
+        private const string GitHubLatestReleaseApi =
+            "https://api.github.com/repos/JoPrew-code/GameWatch/releases/latest";
+
+        private static readonly HttpClient UpdateHttpClient =
+            CreateUpdateHttpClient();
+
+        private UpdateInfo? availableUpdate;
 
         public MainWindow()
         {
@@ -112,6 +125,13 @@ namespace GameWatchDashboard
                 LiveTimer_Tick;
 
             liveTimer.Start();
+
+            Loaded +=
+                async (_, _) =>
+                {
+                    await CheckForUpdatesAsync(
+                        showMessages: false);
+                };
         }
 
         // ============================================================
@@ -332,6 +352,18 @@ namespace GameWatchDashboard
             SettingsNotificationsCheckBox.IsChecked =
                 dashboardSettings.NotificationsEnabled;
 
+            SettingsCurrentVersionText.Text =
+                CurrentVersion;
+
+            SettingsLatestVersionText.Text =
+                "Not checked yet";
+
+            SettingsAboutVersionText.Text =
+                $"Dashboard Version {CurrentVersion}";
+
+            SettingsInstallUpdateButton.Visibility =
+                Visibility.Collapsed;
+
             SettingsLaunchAtStartupCheckBox.Click +=
                 SettingsLaunchAtStartupCheckBox_Click;
 
@@ -346,6 +378,12 @@ namespace GameWatchDashboard
 
             SettingsOpenLogsButton.Click +=
                 SettingsOpenLogsButton_Click;
+
+            SettingsCheckForUpdatesButton.Click +=
+                SettingsCheckForUpdatesButton_Click;
+
+            SettingsInstallUpdateButton.Click +=
+                SettingsInstallUpdateButton_Click;
         }
 
         private DashboardSettings LoadDashboardSettings()
@@ -585,6 +623,455 @@ namespace GameWatchDashboard
                 SettingsStatusText.Text =
                     $"Could not open Event Viewer: {ex.Message}";
             }
+        }
+
+        // ============================================================
+        // UPDATES
+        // ============================================================
+
+        private static HttpClient CreateUpdateHttpClient()
+        {
+            HttpClient client =
+                new();
+
+            client.DefaultRequestHeaders.UserAgent.ParseAdd(
+                $"GameWatchDashboard/{CurrentVersion}");
+
+            client.DefaultRequestHeaders.Accept.ParseAdd(
+                "application/vnd.github+json");
+
+            client.Timeout =
+                TimeSpan.FromSeconds(30);
+
+            return client;
+        }
+
+        private async void SettingsCheckForUpdatesButton_Click(
+            object sender,
+            RoutedEventArgs e)
+        {
+            await CheckForUpdatesAsync(
+                showMessages: true);
+        }
+
+        private async void SettingsInstallUpdateButton_Click(
+            object sender,
+            RoutedEventArgs e)
+        {
+            await DownloadAndInstallUpdateAsync();
+        }
+
+        private async Task CheckForUpdatesAsync(
+            bool showMessages)
+        {
+            SettingsCheckForUpdatesButton.IsEnabled =
+                false;
+
+            SettingsInstallUpdateButton.IsEnabled =
+                false;
+
+            SettingsUpdateStatusText.Text =
+                "Checking GitHub for the latest GameWatch release...";
+
+            try
+            {
+                using HttpResponseMessage response =
+                    await UpdateHttpClient.GetAsync(
+                        GitHubLatestReleaseApi);
+
+                response.EnsureSuccessStatusCode();
+
+                string json =
+                    await response.Content.ReadAsStringAsync();
+
+                using JsonDocument document =
+                    JsonDocument.Parse(json);
+
+                JsonElement root =
+                    document.RootElement;
+
+                if (!root.TryGetProperty(
+                        "tag_name",
+                        out JsonElement tagElement))
+                {
+                    throw new InvalidOperationException(
+                        "The latest GitHub release did not contain a version tag.");
+                }
+
+                string? tagName =
+                    tagElement.GetString();
+
+                string latestVersion =
+                    NormalizeVersion(
+                        tagName);
+
+                SettingsLatestVersionText.Text =
+                    latestVersion;
+
+                availableUpdate =
+                    null;
+
+                SettingsInstallUpdateButton.Visibility =
+                    Visibility.Collapsed;
+
+                if (!IsNewerVersion(
+                        latestVersion,
+                        CurrentVersion))
+                {
+                    SettingsUpdateStatusText.Text =
+                        $"You're up to date. GameWatch {CurrentVersion} is the latest version.";
+
+                    if (showMessages)
+                    {
+                        MessageBox.Show(
+                            this,
+                            $"GameWatch {CurrentVersion} is already the latest version.",
+                            "GameWatch Updates",
+                            MessageBoxButton.OK,
+                            MessageBoxImage.Information);
+                    }
+
+                    return;
+                }
+
+                if (!root.TryGetProperty(
+                        "assets",
+                        out JsonElement assetsElement) ||
+                    assetsElement.ValueKind !=
+                        JsonValueKind.Array)
+                {
+                    throw new InvalidOperationException(
+                        "The latest release does not contain downloadable assets.");
+                }
+
+                string? installerDownloadUrl =
+                    null;
+
+                foreach (JsonElement asset in
+                    assetsElement.EnumerateArray())
+                {
+                    if (!asset.TryGetProperty(
+                            "name",
+                            out JsonElement nameElement) ||
+                        !asset.TryGetProperty(
+                            "browser_download_url",
+                            out JsonElement urlElement))
+                    {
+                        continue;
+                    }
+
+                    string? assetName =
+                        nameElement.GetString();
+
+                    if (!string.Equals(
+                            assetName,
+                            "GameWatchSetup.exe",
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    installerDownloadUrl =
+                        urlElement.GetString();
+
+                    break;
+                }
+
+                if (string.IsNullOrWhiteSpace(
+                        installerDownloadUrl) ||
+                    !IsTrustedGameWatchDownloadUrl(
+                        installerDownloadUrl))
+                {
+                    throw new InvalidOperationException(
+                        "A valid GameWatchSetup.exe asset was not found in the latest release.");
+                }
+
+                availableUpdate =
+                    new UpdateInfo(
+                        latestVersion,
+                        installerDownloadUrl);
+
+                SettingsUpdateStatusText.Text =
+                    $"GameWatch {latestVersion} is available.";
+
+                SettingsInstallUpdateButton.Content =
+                    $"Download & Install {latestVersion}";
+
+                SettingsInstallUpdateButton.Visibility =
+                    Visibility.Visible;
+
+                SettingsInstallUpdateButton.IsEnabled =
+                    true;
+
+                if (!showMessages &&
+                    dashboardSettings.NotificationsEnabled)
+                {
+                    trayIcon.ShowBalloonTip(
+                        "GameWatch Update Available",
+                        $"Version {latestVersion} is ready to install.",
+                        BalloonIcon.Info);
+                }
+            }
+            catch (Exception ex)
+            {
+                SettingsLatestVersionText.Text =
+                    "Unavailable";
+
+                SettingsUpdateStatusText.Text =
+                    $"Could not check for updates: {ex.Message}";
+
+                if (showMessages)
+                {
+                    MessageBox.Show(
+                        this,
+                        $"GameWatch could not check for updates.\n\n{ex.Message}",
+                        "GameWatch Updates",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Warning);
+                }
+            }
+            finally
+            {
+                SettingsCheckForUpdatesButton.IsEnabled =
+                    true;
+
+                if (availableUpdate !=
+                    null)
+                {
+                    SettingsInstallUpdateButton.IsEnabled =
+                        true;
+                }
+            }
+        }
+
+        private async Task DownloadAndInstallUpdateAsync()
+        {
+            UpdateInfo? update =
+                availableUpdate;
+
+            if (update ==
+                null)
+            {
+                await CheckForUpdatesAsync(
+                    showMessages: true);
+
+                update =
+                    availableUpdate;
+
+                if (update ==
+                    null)
+                {
+                    return;
+                }
+            }
+
+            MessageBoxResult answer =
+                MessageBox.Show(
+                    this,
+                    $"Install GameWatch {update.Version}?\n\nThe installer will download from the official GameWatch GitHub release. GameWatch will close while the update installs. Your saved session database will be kept.",
+                    "Install GameWatch Update",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Information,
+                    MessageBoxResult.Yes);
+
+            if (answer !=
+                MessageBoxResult.Yes)
+            {
+                return;
+            }
+
+            SettingsCheckForUpdatesButton.IsEnabled =
+                false;
+
+            SettingsInstallUpdateButton.IsEnabled =
+                false;
+
+            SettingsUpdateStatusText.Text =
+                $"Downloading GameWatch {update.Version}...";
+
+            try
+            {
+                string updateFolder =
+                    Path.Combine(
+                        Path.GetTempPath(),
+                        "GameWatch",
+                        "Updates",
+                        update.Version);
+
+                Directory.CreateDirectory(
+                    updateFolder);
+
+                string installerPath =
+                    Path.Combine(
+                        updateFolder,
+                        "GameWatchSetup.exe");
+
+                using HttpResponseMessage response =
+                    await UpdateHttpClient.GetAsync(
+                        update.DownloadUrl,
+                        HttpCompletionOption.ResponseHeadersRead);
+
+                response.EnsureSuccessStatusCode();
+
+                await using Stream sourceStream =
+                    await response.Content.ReadAsStreamAsync();
+
+                await using FileStream destinationStream =
+                    new(
+                        installerPath,
+                        FileMode.Create,
+                        FileAccess.Write,
+                        FileShare.None);
+
+                await sourceStream.CopyToAsync(
+                    destinationStream);
+
+                await destinationStream.FlushAsync();
+
+                FileInfo installerFile =
+                    new(
+                        installerPath);
+
+                if (!installerFile.Exists ||
+                    installerFile.Length <
+                        1024)
+                {
+                    throw new InvalidOperationException(
+                        "The downloaded installer file was empty or incomplete.");
+                }
+
+                SettingsUpdateStatusText.Text =
+                    "Download complete. Starting the GameWatch installer...";
+
+                Process.Start(
+                    new ProcessStartInfo
+                    {
+                        FileName =
+                            installerPath,
+
+                        UseShellExecute =
+                            true
+                    });
+
+                allowExit =
+                    true;
+
+                liveTimer.Stop();
+
+                trayIcon.Dispose();
+
+                Application.Current.Shutdown();
+            }
+            catch (Exception ex)
+            {
+                SettingsUpdateStatusText.Text =
+                    $"Update failed: {ex.Message}";
+
+                SettingsCheckForUpdatesButton.IsEnabled =
+                    true;
+
+                SettingsInstallUpdateButton.IsEnabled =
+                    true;
+
+                MessageBox.Show(
+                    this,
+                    $"GameWatch could not download or start the update.\n\n{ex.Message}",
+                    "GameWatch Update Failed",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+            }
+        }
+
+        private static string NormalizeVersion(
+            string? tagName)
+        {
+            if (string.IsNullOrWhiteSpace(
+                tagName))
+            {
+                throw new InvalidOperationException(
+                    "The release version was blank.");
+            }
+
+            string version =
+                tagName.Trim();
+
+            if (version.StartsWith(
+                "v",
+                StringComparison.OrdinalIgnoreCase))
+            {
+                version =
+                    version[1..];
+            }
+
+            int prereleaseSeparator =
+                version.IndexOf('-');
+
+            if (prereleaseSeparator >=
+                0)
+            {
+                version =
+                    version[..prereleaseSeparator];
+            }
+
+            if (!Version.TryParse(
+                version,
+                out _))
+            {
+                throw new InvalidOperationException(
+                    $"The release tag '{tagName}' is not a valid version number.");
+            }
+
+            return version;
+        }
+
+        private static bool IsNewerVersion(
+            string latestVersion,
+            string currentVersion)
+        {
+            if (!Version.TryParse(
+                    latestVersion,
+                    out Version? latest) ||
+                !Version.TryParse(
+                    currentVersion,
+                    out Version? current))
+            {
+                return false;
+            }
+
+            return latest >
+                   current;
+        }
+
+        private static bool IsTrustedGameWatchDownloadUrl(
+            string downloadUrl)
+        {
+            if (!Uri.TryCreate(
+                    downloadUrl,
+                    UriKind.Absolute,
+                    out Uri? uri))
+            {
+                return false;
+            }
+
+            if (!uri.Scheme.Equals(
+                    Uri.UriSchemeHttps,
+                    StringComparison.OrdinalIgnoreCase) ||
+                !uri.Host.Equals(
+                    "github.com",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            string expectedPrefix =
+                "/JoPrew-code/GameWatch/releases/download/";
+
+            return uri.AbsolutePath.StartsWith(
+                       expectedPrefix,
+                       StringComparison.OrdinalIgnoreCase) &&
+                   uri.AbsolutePath.EndsWith(
+                       "/GameWatchSetup.exe",
+                       StringComparison.OrdinalIgnoreCase);
         }
 
         // ============================================================
@@ -3623,6 +4110,10 @@ namespace GameWatchDashboard
             DateTime Date,
             int Seconds,
             int SessionCount);
+        private record UpdateInfo(
+            string Version,
+            string DownloadUrl);
+
         private sealed class DashboardSettings
         {
             public bool MinimizeToTray { get; set; } = true;
